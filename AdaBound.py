@@ -52,15 +52,14 @@ class AdaBoundOptimizer(optimizer.Optimizer):
 
     def _create_slots(self, var_list):
         first_var = min(var_list, key=lambda x: x.name)
-
-        create_new = self._beta1_power is None
-        if not create_new and context.in_graph_mode():
-            create_new = (self._beta1_power.graph is not first_var.graph)
-
-        if create_new:
-            with ops.colocate_with(first_var):
-                self._beta1_power = variable_scope.variable(self._beta1, name="beta1_power", trainable=False)
-                self._beta2_power = variable_scope.variable(self._beta2, name="beta2_power", trainable=False)
+        
+        self._create_non_slot_variable(initial_value=self._beta1,
+                                       name="beta1_power",
+                                       colocate_with=first_var)
+        self._create_non_slot_variable(initial_value=self._beta2,
+                                       name="beta2_power",
+                                       colocate_with=first_var)
+        
         # Create slots for the first and second moments.
         for v in var_list :
             self._zeros_slot(v, "m", self._name)
@@ -76,9 +75,19 @@ class AdaBoundOptimizer(optimizer.Optimizer):
         self._epsilon_t = ops.convert_to_tensor(self._epsilon)
         self._gamma_t = ops.convert_to_tensor(self._gamma)
 
+    def _get_beta_accumulators(self):
+        with ops.init_scope():
+            if context.executing_eagerly():
+                graph = None
+            else:
+                graph = ops.get_default_graph()
+            return (self._get_non_slot_variable("beta1_power", graph=graph),
+                    self._get_non_slot_variable("beta2_power", graph=graph))
+
     def _apply_dense(self, grad, var):
-        beta1_power = math_ops.cast(self._beta1_power, var.dtype.base_dtype)
-        beta2_power = math_ops.cast(self._beta2_power, var.dtype.base_dtype)
+        beta1_power, beta2_power = self._get_beta_accumulators()
+        beta1_power = math_ops.cast(beta1_power, var.dtype.base_dtype)
+        beta2_power = math_ops.cast(beta2_power, var.dtype.base_dtype)
         lr_t = math_ops.cast(self._lr_t, var.dtype.base_dtype)
         base_lr_t = math_ops.cast(self._base_lr_t, var.dtype.base_dtype)
         beta1_t = math_ops.cast(self._beta1_t, var.dtype.base_dtype)
@@ -119,9 +128,9 @@ class AdaBoundOptimizer(optimizer.Optimizer):
         return control_flow_ops.group(*[var_update, m_t, v_t, vhat_t])
 
     def _resource_apply_dense(self, grad, var):
-        var = var.handle
-        beta1_power = math_ops.cast(self._beta1_power, grad.dtype.base_dtype)
-        beta2_power = math_ops.cast(self._beta2_power, grad.dtype.base_dtype)
+        beta1_power, beta2_power = self._get_beta_accumulators()
+        beta1_power = math_ops.cast(beta1_power, grad.dtype.base_dtype)
+        beta2_power = math_ops.cast(beta2_power, grad.dtype.base_dtype)
         lr_t = math_ops.cast(self._lr_t, grad.dtype.base_dtype)
         base_lr_t = math_ops.cast(self._base_lr_t, var.dtype.base_dtype)
         beta1_t = math_ops.cast(self._beta1_t, grad.dtype.base_dtype)
@@ -135,17 +144,17 @@ class AdaBoundOptimizer(optimizer.Optimizer):
         upper_bound = final_lr * (1. + 1. / (gamma_t))
 
         # m_t = beta1 * m + (1 - beta1) * g_t
-        m = self.get_slot(var, "m").handle
+        m = self.get_slot(var, "m")
         m_scaled_g_values = grad * (1 - beta1_t)
         m_t = state_ops.assign(m, beta1_t * m + m_scaled_g_values, use_locking=self._use_locking)
 
         # v_t = beta2 * v + (1 - beta2) * (g_t * g_t)
-        v = self.get_slot(var, "v").handle
+        v = self.get_slot(var, "v")
         v_scaled_g_values = (grad * grad) * (1 - beta2_t)
         v_t = state_ops.assign(v, beta2_t * v + v_scaled_g_values, use_locking=self._use_locking)
 
         # amsgrad
-        vhat = self.get_slot(var, "vhat").handle
+        vhat = self.get_slot(var, "vhat")
         if self._amsbound:
             vhat_t = state_ops.assign(vhat, math_ops.maximum(v_t, vhat))
             v_sqrt = math_ops.sqrt(vhat_t)
@@ -162,8 +171,9 @@ class AdaBoundOptimizer(optimizer.Optimizer):
         return control_flow_ops.group(*[var_update, m_t, v_t, vhat_t])
 
     def _apply_sparse_shared(self, grad, var, indices, scatter_add):
-        beta1_power = math_ops.cast(self._beta1_power, var.dtype.base_dtype)
-        beta2_power = math_ops.cast(self._beta2_power, var.dtype.base_dtype)
+        beta1_power, beta2_power = self._get_beta_accumulators()
+        beta1_power = math_ops.cast(beta1_power, var.dtype.base_dtype)
+        beta2_power = math_ops.cast(beta2_power, var.dtype.base_dtype)
         lr_t = math_ops.cast(self._lr_t, var.dtype.base_dtype)
         base_lr_t = math_ops.cast(self._base_lr_t, var.dtype.base_dtype)
         beta1_t = math_ops.cast(self._beta1_t, var.dtype.base_dtype)
@@ -225,12 +235,13 @@ class AdaBoundOptimizer(optimizer.Optimizer):
     def _finish(self, update_ops, name_scope):
         # Update the power accumulators.
         with ops.control_dependencies(update_ops):
-            with ops.colocate_with(self._beta1_power):
-                update_beta1 = self._beta1_power.assign(
-                    self._beta1_power * self._beta1_t,
+            beta1_power, beta2_power = self._get_beta_accumulators()
+            with ops.colocate_with(beta1_power):
+                update_beta1 = beta1_power.assign(
+                    beta1_power * self._beta1_t,
                     use_locking=self._use_locking)
-                update_beta2 = self._beta2_power.assign(
-                    self._beta2_power * self._beta2_t,
+                update_beta2 = beta2_power.assign(
+                    beta2_power * self._beta2_t,
                     use_locking=self._use_locking)
         return control_flow_ops.group(*update_ops + [update_beta1, update_beta2],
                                       name=name_scope)
